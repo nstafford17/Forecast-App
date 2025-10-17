@@ -1,0 +1,622 @@
+import io
+import re
+from typing import Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
+import warnings
+warnings.simplefilter("ignore", ConvergenceWarning)
+
+try:
+    import pmdarima as pm
+    HAS_PMDARIMA = True
+except Exception:
+    HAS_PMDARIMA = False
+
+st.set_page_config(page_title="Sales → Forecast", layout="wide")
+
+# -------------------- Top row with logo and title --------------------
+col1, col2 = st.columns([1, 3])
+with col1:
+    st.image("winthrop_inverted.png", width=240)  # adjust as needed
+with col2:
+    st.markdown(
+        """
+        <h1 style='color:black; font-family:sans-serif; margin-bottom:0;'>Forecast Future Demand</h1>
+        <p style='color:gray; font-size:16px; margin-top:0;'>Explore different forecasting models by product</p>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# -------------------- Sidebar controls --------------------
+with st.sidebar:
+    st.header("Controls")
+
+    # Map human labels → pandas freq codes
+    freq_label = st.selectbox("Resample frequency", ["Weekly", "Monthly", "Quarterly", "Yearly"], index=1)
+    FREQ_MAP = {"Weekly": "W", "Monthly": "M", "Quarterly": "Q", "Yearly": "Y"}
+    freq = FREQ_MAP[freq_label]
+
+    # Horizon is always exactly one full year ahead (auto-set)
+    HORIZON_MAP = {"W": 52, "M": 12, "Q": 4, "Y": 1}
+    horizon = HORIZON_MAP[freq]
+    st.caption(f"Forecast horizon automatically set to 1 year ({horizon} periods)")
+
+    model_name = st.selectbox(
+        "Model",
+        ["Seasonal Naive", "Holt-Winters (ETS)", "SARIMA (auto)", "Colby Method"],
+        help="Auto-ARIMA requires pmdarima; app will fall back if not available.",
+    )
+
+    season_length = {"W": 52, "M": 12, "Q": 4, "Y": 1}[freq]
+    st.caption(f"Season length automatically set to **{season_length}** ({freq_label.lower()} data = 1 full year)")
+
+    # ================== CASCADING PRODUCT UI (in sidebar) ==================
+    with st.expander("Product Filters", expanded=True):
+        st.markdown("**Product Type**")
+        sel_butts = st.checkbox("Butts", value=False, key="pt_butts")
+        sel_guides = st.checkbox("Guides", value=False, key="pt_guides")
+        sel_tops = st.checkbox("Tops", value=False, key="pt_tops")
+
+        # Collect selections (safe defaults)
+        selections = {
+            "Product Type": [],
+            "Butt Type": None,
+            "Ferrule Size": None,
+            "Colour": None,
+            "Handle Length": None,
+            "Gimbal Size": None,
+        }
+        butt_type = None
+        show_next = False
+        ferrule_opts = []
+        next_title = ""
+        next_opts = []
+        next_key = None
+
+        if sel_butts:
+            selections["Product Type"].append("Butts")
+
+            butt_type = st.radio("Butt Type", ["Terminator", "Epic", "T-10X"], key="butt_type")
+            selections["Butt Type"] = butt_type
+
+            # --- Branching (T-10X has NO handle/gimbal section) ---
+            if butt_type == "Terminator":
+                ferrule_opts = ["#2", "#4"]
+                show_next = True
+                next_title = "Handle Length"
+                next_opts = ["Short", "Long"]
+                next_key = "Handle Length"
+                selections["Gimbal Size"] = None
+            elif butt_type == "Epic":
+                ferrule_opts = ["#1", "#2"]
+                show_next = True
+                next_title = "Gimbal Size"
+                next_opts = ["Short", "Long"]
+                next_key = "Gimbal Size"
+                selections["Handle Length"] = None
+            else:  # T-10X
+                ferrule_opts = ["#4", "#6"]
+                show_next = False
+                selections["Handle Length"] = None
+                selections["Gimbal Size"] = None
+
+            # Ferrule Size (always for Butts)
+            ferrule = st.radio("Ferrule Size", ferrule_opts, key="ferrule_size")
+            selections["Ferrule Size"] = ferrule
+
+            # Colour (always after Ferrule Size)
+            colour = st.radio("Colour", ["Black", "Silver", "Blue", "Custom"], key="butt_colour")
+            selections["Colour"] = colour
+
+            # Only show the next section for Terminator/Epic
+            if show_next:
+                next_sel = st.radio(next_title, next_opts, key="butt_next")
+                selections[next_key] = next_sel
+
+        if sel_guides:
+            selections["Product Type"].append("Guides")
+            st.caption("Subfilters for Guides can be added later.")
+
+        if sel_tops:
+            selections["Product Type"].append("Tops")
+            st.caption("Subfilters for Tops can be added later.")
+
+    st.markdown("---")
+
+    # Use Due Date toggle + single uploader (keep both inside the sidebar)
+    prefer_due_date = st.checkbox("Use 'Due Date' as the date column (if available)", value=True)
+uploaded = st.file_uploader("Upload CSV", type=["csv"], key="csv_uploader")
+
+# Placeholder for Part Number select (we’ll fill after reading CSV)
+part_choice_placeholder = st.empty()
+
+# -------------------- Data loading --------------------
+@st.cache_data(show_spinner=False)
+def load_csv(file, preferred_date_col: Optional[str] = None) -> Tuple[pd.DataFrame, str, str]:
+    df = pd.read_csv(file)
+    df.columns = [c.strip() for c in df.columns]
+
+    # Dates & quantities
+    date_col_candidates = ["Due Date", "Create Date", "Closed Date", "Date", "Open Date"]
+
+    # Honor preferred_date_col when present
+    if preferred_date_col and preferred_date_col in df.columns:
+        date_col = preferred_date_col
+    else:
+        date_col = next((c for c in date_col_candidates if c in df.columns), None)
+
+    if date_col is None:
+        raise ValueError("No date-like column found. Include 'Due Date' or 'Date' (or 'Open Date').")
+
+    if "Qty Due" not in df.columns:
+        raise ValueError("Expected a 'Qty Due' column but it was not found in the uploaded file.")
+    qty_col = "Qty Due"
+
+    # Parse chosen date column and Create Date (if exists) for completeness rules
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    if "Create Date" in df.columns:
+        df["Create Date"] = pd.to_datetime(df["Create Date"], errors="coerce")
+    df = df.dropna(subset=[date_col])
+    df[qty_col] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0.0)
+
+    if "Part Number" not in df.columns:
+        df["Part Number"] = "ALL"
+
+    return df, date_col, qty_col
+
+# -------------------- Pattern-based filtering on Part Number --------------------
+EXCLUDE_PRIORITY = ["AC ", "CART ", " SET", "SFC ", "SA ", "SP ", "SC "]
+
+def filter_by_partnumber_patterns(df: pd.DataFrame, selections: dict) -> pd.DataFrame:
+    """
+    Apply includes/excludes to df using ONLY the Part Number column, based on
+    sidebar selections. Exclusions always win.
+    """
+    d = df.copy()
+    pn = d["Part Number"].astype(str).str.lower()
+
+    # --- Exclusions (always win) ---
+    exclude_mask = pd.Series(False, index=d.index)
+    for token in EXCLUDE_PRIORITY:
+        t = token.lower()
+        exclude_mask |= pn.str.contains(re.escape(t), na=False)
+    d = d[~exclude_mask]
+    pn = d["Part Number"].astype(str).str.lower()  # refresh after filtering
+
+    # If Butts not selected, skip the rest (no patterns for Guides/Tops provided)
+    if "Butts" not in selections.get("Product Type", []):
+        return d
+
+    butt_type = (selections.get("Butt Type") or "").lower()
+    ferrule   = (selections.get("Ferrule Size") or "").lower()
+
+    # Base tokens by butt type
+    base_token = None
+    if butt_type == "terminator":
+        base_token = "trmtr "
+    elif butt_type == "epic":
+        base_token = "epic "
+    elif butt_type == "t-10x":
+        base_token = "t-10x "
+    else:
+        return d
+
+    base_mask = pn.str.contains(re.escape(base_token), na=False)
+
+    # Ferrule refinement
+    if butt_type == "terminator":
+        if ferrule == "#2":
+            ferr_mask = pn.str.contains(re.escape(" #2 "), na=False)
+            include_mask = base_mask & ferr_mask
+        elif ferrule == "#4":
+            ferr_mask = pn.str.contains(re.escape(" #4 "), na=False)
+            include_mask = base_mask & ferr_mask
+        else:
+            include_mask = base_mask
+
+    elif butt_type == "t-10x":
+        if ferrule == "#4":
+            ferr_mask = pn.str.contains(re.escape(" #4 "), na=False)
+            include_mask = base_mask & ferr_mask
+        elif ferrule == "#6":
+            ferr_mask = pn.str.contains(re.escape(" #6 "), na=False)
+            include_mask = base_mask & ferr_mask
+        else:
+            include_mask = base_mask
+
+    else:  # Epic
+        if ferrule == "#2":
+            ferr_mask = pn.str.contains(re.escape(" #2 "), na=False)
+            include_mask = base_mask & ferr_mask
+        else:
+            # Epic #1 = no explicit number present → exclude rows that mention " #2 "
+            not_2_mask = ~pn.str.contains(re.escape(" #2 "), na=False)
+            include_mask = base_mask & not_2_mask
+
+    return d[include_mask]
+
+# -------------------- Series & model helpers --------------------
+
+def _next_step_from_index(idx: pd.DatetimeIndex):
+    if len(idx) >= 2:
+        return idx[-1] - idx[-2]
+    return pd.tseries.frequencies.to_offset(idx.freq)
+
+
+def cap_h_to_one_year(idx: pd.DatetimeIndex, h: int) -> int:
+    """
+    Return the number of forecast steps (<= h) that stay within one calendar year
+    after the last observed timestamp in idx.
+    """
+    if len(idx) == 0:
+        return 0
+    last_date = idx[-1]
+    end_limit = last_date + pd.DateOffset(years=1)
+
+    # Build at most h steps, then count how many are within the limit
+    future_idx = pd.date_range(last_date + _next_step_from_index(idx), periods=h, freq=idx.freq)
+    return int((future_idx <= end_limit).sum())
+
+
+def to_series(df, date_col, qty_col, part=None, freq="M"):
+    d = df.copy()
+    if part is not None:
+        d = d[d["Part Number"] == part]
+    s = (
+        d.groupby(d[date_col].dt.to_period("D"))[qty_col]
+        .sum()
+        .rename("y")
+    )
+    s.index = s.index.to_timestamp()
+    s = s.resample(freq).sum().fillna(0.0)
+    s = s.asfreq(freq, fill_value=0.0)
+    return s
+
+
+def to_series_by_create(df: pd.DataFrame, qty_col: str, part: Optional[str], freq: str) -> pd.Series:
+    d = df.copy()
+    if part is not None:
+        d = d[d["Part Number"] == part]
+    if "Create Date" not in d.columns:
+        return pd.Series(dtype=float)
+    s = (
+        d.groupby(pd.to_datetime(d["Create Date"]).dt.to_period("D"))[qty_col]
+        .sum()
+        .rename("y_create")
+    )
+    s.index = s.index.to_timestamp()
+    s = s.resample(freq).sum().fillna(0.0)
+    s = s.asfreq(freq, fill_value=0.0)
+    return s
+
+PER_YR = {"W": 52, "M": 12, "Q": 4, "Y": 1}
+
+def completed_periods_from_create(df: pd.DataFrame, part: Optional[str], freq: str) -> set:
+    """A period p is 'complete' if there is at least one order in the *next* period by Create Date."""
+    s = to_series_by_create(df, "Qty Due", part, freq)
+    if s.empty:
+        return set()
+    periods = s.index.to_period(freq)
+    # presence per period
+    pres = pd.Series(1, index=periods).groupby(level=0).sum()
+    next_pres = pres.shift(-1, fill_value=0)
+    complete = pres.index[next_pres > 0]
+    return set(complete)
+
+
+def compute_excel_colby_growth(df: pd.DataFrame, qty_col: str, part: Optional[str], freq: str) -> tuple[float, int, Optional[pd.Period]]:
+    """Return (g, L_used, anchor_period). Prefer L=2; if not feasible, try L=1; else g=0.
+    g = ((y_t - y_{t-L})/y_{t-L}) / L  (non-compounded)
+    y_t and y_{t-L} are sums by **Create Date** for the same seasonal position.
+    Only periods with at least one order in the *next* create-date period are eligible.
+    """
+    s_create = to_series_by_create(df, qty_col, part, freq)
+    if s_create.empty:
+        return 0.0, 0, None
+    completed = completed_periods_from_create(df, part, freq)
+    s_per = s_create.copy()
+    s_per.index = s_per.index.to_period(freq)
+
+    # latest completed period present in s_per
+    candidates = [p for p in s_per.index if p in completed]
+    if not candidates:
+        return 0.0, 0, None
+    p0 = max(candidates)
+    m = PER_YR[freq]
+
+    def safe_div(a, b):
+        return a / (b if abs(b) > 1e-12 else 1e-12)
+
+    # Try L=2 first
+    p2 = p0 - m * 2
+    if p2 in s_per.index:
+        y_t = float(s_per.loc[p0])
+        y_past = float(s_per.loc[p2])
+        g = safe_div(y_t - y_past, y_past) / 2.0
+        return g, 2, p0
+
+    # Fall back to L=1
+    p1 = p0 - m
+    if p1 in s_per.index:
+        y_t = float(s_per.loc[p0])
+        y_past = float(s_per.loc[p1])
+        g = safe_div(y_t - y_past, y_past) / 1.0
+        return g, 1, p0
+
+    return 0.0, 0, p0
+
+
+def train_test_split_series(s: pd.Series, test_h):
+    if len(s) <= test_h + 3:
+        return s, pd.Series(dtype=float)
+    return s.iloc[:-test_h], s.iloc[-test_h:]
+
+
+def seasonal_naive_forecast(train, h, m):
+    base = np.tile(train.values[-1], h) if len(train) < m else np.resize(train.values[-m:], h)
+    idx = pd.date_range(train.index[-1] + _next_step_from_index(train.index), periods=h, freq=train.index.freq)
+    return pd.Series(base, index=idx, name="forecast")
+
+
+def holt_winters_forecast(train, h, m):
+    trend = "add"
+    seasonal = "add" if m > 1 else None
+    model = ExponentialSmoothing(train, trend=trend, seasonal=seasonal, seasonal_periods=m)
+    fitted = model.fit(optimized=True, use_brute=True)
+    fcast = fitted.forecast(h)
+    fcast.name = "forecast"
+    return fcast
+
+
+def sarima_auto_forecast(train, h, m):
+    if not HAS_PMDARIMA:
+        raise RuntimeError("pmdarima is not installed.")
+    model = pm.auto_arima(
+        train,
+        seasonal=(m > 1),
+        m=m,
+        stationary=False,
+        stepwise=True,
+        suppress_warnings=True,
+        error_action="ignore",
+        trace=False,
+    )
+    fcast = model.predict(n_periods=h)
+    idx = pd.date_range(train.index[-1] + _next_step_from_index(train.index), periods=h, freq=train.index.freq)
+    return pd.Series(fcast, index=idx, name="forecast")
+
+# -------------------- Colby Method (Excel-style) --------------------
+
+def colby_forecast_with_g(train: pd.Series, h: int, m: int, g: float):
+    idx = pd.date_range(train.index[-1] + _next_step_from_index(train.index), periods=h, freq=train.index.freq)
+    fvals, hist_forecast = [], train.copy()
+    for i in range(1, h + 1):
+        ref_time = idx[i - 1] - (idx.freq * m)  # one season earlier
+        base = hist_forecast.loc[ref_time] if ref_time in hist_forecast.index else hist_forecast.iloc[-1]
+        next_val = float(base) * (1.0 + g)
+        fvals.append(next_val)
+        hist_forecast.loc[idx[i - 1]] = next_val
+    fcast = pd.Series(fvals, index=idx, name="forecast")
+    return fcast, g
+
+
+def metric(y_true, y_pred, which):
+    if which == "MAE":
+        return float(np.mean(np.abs(y_true - y_pred)))
+    if which == "RMSE":
+        return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+    if which == "MAPE":
+        denom = np.where(y_true == 0, 1e-8, y_true)
+        return float(np.mean(np.abs((y_true - y_pred) / denom)) * 100)
+    return np.nan
+
+
+def fit_and_forecast(train, h, m, model_name):
+    if model_name == "Seasonal Naive":
+        return seasonal_naive_forecast(train, h, m)
+    elif model_name == "Holt-Winters (ETS)":
+        return holt_winters_forecast(train, h, m)
+    elif model_name == "SARIMA (auto)":
+        return sarima_auto_forecast(train, h, m)
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
+
+# -------------------- Main UI --------------------
+# (Uploader already created in the sidebar)
+if uploaded is None:
+    st.info("Upload your CSV with Customer, Open Date, and Part Number to get started.")
+    st.stop()
+
+try:
+    df, date_col, qty_col = load_csv(
+        uploaded,
+        preferred_date_col=("Due Date" if prefer_due_date else None),
+    )
+except Exception as e:
+    st.error(str(e))
+    st.stop()
+
+# Apply pattern-based filters BEFORE Part Number equals filter
+df_filtered_by_patterns = filter_by_partnumber_patterns(df, selections)
+
+# Now that we have df, populate the Part Number selectbox in the sidebar
+with st.sidebar:
+    parts = [
+        "ALL",
+        *sorted([p for p in df_filtered_by_patterns["Part Number"].dropna().unique() if p != "ALL"]),
+    ]
+    part_choice = part_choice_placeholder.selectbox("Part Number", parts, index=0)
+current_part = None if part_choice == "ALL" else part_choice
+
+# ---------- Time series + plots ----------
+s = to_series(df_filtered_by_patterns, date_col, qty_col, part=current_part, freq=freq)
+
+left, right = st.columns([2, 1])
+with left:
+    st.subheader("Time Series")
+    st.write(f"Observations: **{len(s)}** | Frequency: **{freq_label} ({freq})**")
+
+    fig = go.Figure()
+
+    # --- Actual line ---
+    fig.add_trace(
+        go.Scatter(
+            x=s.index,
+            y=s.values,
+            name="Actual",
+            mode="lines+markers",
+            line=dict(width=2),
+            marker=dict(size=5),
+            hovertemplate="Date: %{x|%b %Y}<br>Qty Due: %{y:.0f}<extra></extra>",
+        )
+    )
+
+    # --- Titles & axis labels ---
+    fig.update_layout(
+        title=dict(text="Historical Sales (Total Qty Due)", x=0.5, font=dict(size=20)),
+        xaxis_title="Date",
+        yaxis_title="Total Quantity Due",
+        xaxis=dict(showgrid=True, tickangle=-45),
+        yaxis=dict(showgrid=True),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=420,
+        margin=dict(l=20, r=20, t=50, b=40),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+# Split for backtest (simple last-h-steps holdout)
+train, test = train_test_split_series(s, horizon)
+
+# ---- Cap the forecast horizon to stay within one year of the last observed date
+h_use = cap_h_to_one_year(train.index, horizon)
+if h_use < 1:
+    st.warning("Not enough room to forecast within one year of the last date.")
+    st.stop()
+if h_use < horizon:
+    st.info(f"Capping forecast horizon to **{h_use}** to stay within one year of the last observed date.")
+
+if h_use < horizon:
+    st.info(f"Capping forecast horizon to **{h_use}** to stay within one year of the last observed date.")
+
+# Fit + Forecast using the selected model
+try:
+    if model_name == "Colby Method":
+        # Compute Excel-style growth g using Create Date completeness rule (prefer 2 years, else 1)
+        g, L_used, anchor = compute_excel_colby_growth(df_filtered_by_patterns, qty_col, current_part, freq)
+        # Anchor the training series to the **last usable (completed) period**
+        if anchor is None:
+            train_colby = train
+            h_colby = h_use
+        else:
+            p_index = s.index.to_period(freq)
+            mask = p_index <= anchor
+            train_colby = s[mask]
+            # Forecast exactly one year **after the anchor**
+            h_colby = season_length  # 52/12/4/1
+        forecast, g = colby_forecast_with_g(train_colby, h_colby, season_length, g)
+        label_L = "2 years" if L_used == 2 else ("1 year" if L_used == 1 else "auto 0")
+        st.markdown(f"**Excel-style annual growth (g):** {g * 100:.2f}% per year (lookback: {label_L}; anchor: {str(anchor) if anchor is not None else 'latest data'})")
+    else:
+        forecast = fit_and_forecast(train, h_use, season_length, model_name)
+except Exception as e:
+    st.error(f"Model failed: {e}")
+    st.stop()
+
+# Compute backtest metrics if we had a test split
+metric_names = ["MAE", "RMSE", "MAPE"]
+results = {}
+if len(test) > 0:
+    try:
+        if model_name == "Colby Method":
+            g_bt, _, _ = compute_excel_colby_growth(df_filtered_by_patterns, qty_col, current_part, freq)
+            bt_forecast, _ = colby_forecast_with_g(train, len(test), season_length, g_bt)
+        else:
+            bt_forecast = fit_and_forecast(train, len(test), season_length, model_name)
+        for mname in metric_names:
+            results[mname] = metric(test.values, bt_forecast.values, mname)
+    except Exception as e:
+        st.warning(f"Backtest failed for metrics: {e}")
+
+with right:
+    top_l, top_r = st.columns([1, 1])
+    with top_l:
+        st.subheader("Backtest Metrics")
+
+    with top_r:
+        # Small pop-up (uses popover if supported; otherwise expander)
+        if hasattr(st, "popover"):
+            with st.popover("❓ Metrics", use_container_width=True):
+                st.markdown(
+                    "**MAE**: Average absolute error (units). Lower is better."
+                    "**RMSE**: Root mean squared error (units). Penalizes large errors. Lower is better."
+                    "**MAPE**: Average absolute percentage error (%). Lower is better; beware when actuals are near zero."
+                )
+        else:
+            with st.expander("❓ Metrics"):
+                st.markdown(
+                    "**MAE**: Average absolute error (units). Lower is better."
+                    "**RMSE**: Root mean squared error (units). Penalizes large errors. Lower is better."
+                    "**MAPE**: Average absolute percentage error (%). Lower is better; beware when actuals are near zero."
+                )
+
+    if results:
+        st.dataframe(pd.DataFrame(results, index=["Value"]).T)
+    else:
+        st.caption("Not enough history for a backtest split.")
+
+# Combine for plotting
+full_fig = go.Figure()
+full_fig.add_trace(go.Scatter(x=s.index, y=s.values, name="Actual", mode="lines"))
+full_fig.add_trace(go.Scatter(x=forecast.index, y=forecast.values, name="Forecast", mode="lines"))
+full_fig.update_layout(title="Actuals + Forecast", height=500, margin=dict(l=10, r=10, t=40, b=10))
+st.plotly_chart(full_fig, use_container_width=True)
+
+st.download_button(
+    "Download forecast as CSV",
+    data=forecast.to_csv(index=True).encode("utf-8"),
+    file_name="forecast.csv",
+    mime="text/csv",
+)
+
+with st.expander("⚙️ Advanced / Tips"):
+    st.markdown(
+        """
+- Product filtering uses only the **Part Number** column with your exact substring rules (case-insensitive).
+- **Exclusions** always win: any Part Number containing one of `AC , CART ,  SET, SFC , SA , SP , SC ` is removed first.
+- For **Epic #1**, we treat "no number present" as #1 (we exclude rows with " #2 ").
+- You can still filter down to a single Part Number using the sidebar select (applied after pattern filters).
+- If weekly data is noisy, try **Monthly** frequency or increase the **season length**.
+        """
+    )
+
+# -------------------- Forecast Table --------------------
+st.subheader("Forecast Table")
+
+# Build a nice Period label from the DatetimeIndex using your selected freq
+period_labels = forecast.index.to_period(freq).astype(str)
+forecast_table = pd.DataFrame({"Period": period_labels, "Forecast": forecast.values})
+
+# Display with sensible formatting
+try:
+    st.dataframe(forecast_table, use_container_width=True)
+except Exception:
+    st.table(forecast_table)
+
+# -------------------- Summary counts --------------------
+st.markdown("---")
+st.subheader("Data Summary After Filters")
+
+count_total = len(df)
+count_filtered = len(df_filtered_by_patterns)
+count_unique_parts = df_filtered_by_patterns["Part Number"].nunique()
+
+st.write(f"**Rows in original file:** {count_total:,}")
+st.write(f"**Rows after filters:** {count_filtered:,}")
+st.write(f"**Unique Part Numbers remaining:** {count_unique_parts:,}")

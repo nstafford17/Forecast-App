@@ -1,0 +1,536 @@
+# app.py — Colby-only Forecast App (with Product Filters)
+# -------------------------------------------------------------
+# Fresh scaffold with:
+#  - CSV upload
+#  - Column selectors (date/value)
+#  - Cascading Product Filters (Butts/Epic/T-10X) that operate on Part Number
+#  - Customer / Part multiselect filters
+#  - Date range filter
+#  - Colby (per-quarter) placeholder implementation w/ math/debug
+#  - Plot + forecast table
+#
+# How to run:
+#   1) pip install streamlit pandas numpy plotly
+#   2) streamlit run app.py
+# -------------------------------------------------------------
+
+from __future__ import annotations
+import io
+import re
+from typing import Optional, Tuple, Dict, Any
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+
+st.set_page_config(page_title="Forecast → Colby", layout="wide")
+
+
+col1, col2 = st.columns([1, 4])
+
+with col1:
+    st.image("winthrop_inverted.png", width=600)  # replace with your logo file
+
+with col2:
+    st.markdown(
+        "<h1 style='color:black; font-family:sans-serif; margin-bottom:0;'>"
+        "Forecasting Dashboard"
+        "</h1>",
+        unsafe_allow_html=True
+    )
+
+st.write("Upload your shipping CSV and explore the forecast.")
+
+# -------------------------- Utilities --------------------------
+
+def _is_numeric(s: pd.Series) -> bool:
+    return pd.api.types.is_numeric_dtype(s)
+
+@st.cache_data(show_spinner=False)
+def load_csv(file) -> pd.DataFrame:
+    df = pd.read_csv(file)
+    return df
+
+# ----------------- Product Filters (UI + logic) ----------------
+# Exclusions always win (exactly like your other app)
+EXCLUDE_PRIORITY = ["AC ", "CART ", " SET", "SFC ", "SA ", "SP ", "SC "]
+
+def render_product_filters() -> Dict[str, Any]:
+    """
+    Renders the cascading product filters UI and returns a 'selections' dict.
+    Applies to the Part Number column only.
+    """
+    with st.expander("Product Filters (Part Number patterns)", expanded=True):
+        st.markdown("**Product Type**")
+        sel_butts = st.checkbox("Butts", value=False, key="pt_butts")
+        sel_guides = st.checkbox("Guides", value=False, key="pt_guides")
+        sel_tops = st.checkbox("Tops", value=False, key="pt_tops")
+
+        selections: Dict[str, Any] = {
+            "Product Type": [],
+            "Butt Type": None,
+            "Ferrule Size": None,
+            "Colour": None,
+            "Handle Length": None,
+            "Gimbal Size": None,
+        }
+
+        butt_type = None
+        show_next = False
+        ferrule_opts = []
+        next_title = ""
+        next_opts = []
+        next_key: Optional[str] = None
+
+        if sel_butts:
+            selections["Product Type"].append("Butts")
+
+            butt_type = st.radio("Butt Type", ["Terminator", "Epic", "T-10X"], key="butt_type")
+            selections["Butt Type"] = butt_type
+
+            # Branching
+            if butt_type == "Terminator":
+                ferrule_opts = ["#2", "#4"]
+                show_next = True
+                next_title = "Handle Length"
+                next_opts = ["Short", "Long"]
+                next_key = "Handle Length"
+                selections["Gimbal Size"] = None
+            elif butt_type == "Epic":
+                ferrule_opts = ["#1", "#2"]
+                show_next = True
+                next_title = "Gimbal Size"
+                next_opts = ["Short", "Long"]
+                next_key = "Gimbal Size"
+                selections["Handle Length"] = None
+            else:  # T-10X
+                ferrule_opts = ["#4", "#6"]
+                show_next = False
+                selections["Handle Length"] = None
+                selections["Gimbal Size"] = None
+
+            ferrule = st.radio("Ferrule Size", ferrule_opts, key="ferrule_size")
+            selections["Ferrule Size"] = ferrule
+
+            colour = st.radio("Colour", ["Black", "Silver", "Blue", "Custom"], key="butt_colour")
+            selections["Colour"] = colour
+
+            if show_next and next_key:
+                next_sel = st.radio(next_title, next_opts, key="butt_next")
+                selections[next_key] = next_sel
+
+        if sel_guides:
+            selections["Product Type"].append("Guides")
+            st.caption("Subfilters for Guides can be added later.")
+
+        if sel_tops:
+            selections["Product Type"].append("Tops")
+            st.caption("Subfilters for Tops can be added later.")
+
+    return selections
+
+def filter_by_partnumber_patterns(df: pd.DataFrame, selections: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Apply includes/excludes to df using ONLY the Part Number column, based on
+    sidebar selections. Exclusions always win.
+
+    Rules:
+      - First, drop rows whose Part Number contains any EXCLUDE_PRIORITY token
+      - If "Butts" isn't selected, we return after exclusions
+      - If Butts is selected, include rows that match the butt type + ferrule rules
+      - Epic #1 is treated as “no explicit number present” → exclude rows that mention " #2 "
+    """
+    if "Part Number" not in df.columns:
+        return df  # silently no-op if the column doesn't exist
+
+    d = df.copy()
+    pn = d["Part Number"].astype(str).str.lower()
+
+    # Exclusions
+    exclude_mask = pd.Series(False, index=d.index)
+    for token in EXCLUDE_PRIORITY:
+        t = token.lower()
+        exclude_mask |= pn.str.contains(re.escape(t), na=False)
+    d = d[~exclude_mask]
+
+    if "Butts" not in selections.get("Product Type", []):
+        return d
+
+    pn = d["Part Number"].astype(str).str.lower()  # refresh after exclusion
+
+    butt_type = (selections.get("Butt Type") or "").lower()
+    ferrule   = (selections.get("Ferrule Size") or "").lower()
+
+    # Base token by butt type
+    if butt_type == "terminator":
+        base_token = "trmtr "
+    elif butt_type == "epic":
+        base_token = "epic "
+    elif butt_type == "t-10x":
+        base_token = "t-10x "
+    else:
+        return d
+
+    base_mask = pn.str.contains(re.escape(base_token), na=False)
+
+    # Ferrule refinement
+    if butt_type == "terminator":
+        if ferrule == "#2":
+            ferr_mask = pn.str.contains(re.escape(" #2 "), na=False)
+            include_mask = base_mask & ferr_mask
+        elif ferrule == "#4":
+            ferr_mask = pn.str.contains(re.escape(" #4 "), na=False)
+            include_mask = base_mask & ferr_mask
+        else:
+            include_mask = base_mask
+
+    elif butt_type == "t-10x":
+        if ferrule == "#4":
+            ferr_mask = pn.str.contains(re.escape(" #4 "), na=False)
+            include_mask = base_mask & ferr_mask
+        elif ferrule == "#6":
+            ferr_mask = pn.str.contains(re.escape(" #6 "), na=False)
+            include_mask = base_mask & ferr_mask
+        else:
+            include_mask = base_mask
+
+    else:  # Epic
+        if ferrule == "#2":
+            ferr_mask = pn.str.contains(re.escape(" #2 "), na=False)
+            include_mask = base_mask & ferr_mask
+        else:
+            # Epic #1 = no explicit number present → exclude rows with " #2 "
+            not_2_mask = ~pn.str.contains(re.escape(" #2 "), na=False)
+            include_mask = base_mask & not_2_mask
+
+    return d[include_mask]
+
+# --------------------- Colby (implementation) ---------------------
+
+def colby_forecast_from_quarters(qseries: pd.Series, horizon: int = 4, return_debug: bool = False):
+    """
+    Colby method — per-quarter growth:
+      • Work on quarterly totals.
+      • Exclude the quarter containing the latest date; call the cutoff quarter C = latest - 1 quarter.
+      • For each quarter number q ∈ {1,2,3,4}:
+          - L_q = value from the most recent year ≤ C that has quarter q (prefer the year of C if available).
+          - E_q = value from the earliest available year that has quarter q.
+          - factor_q = 1 + (L_q - E_q) / E_q  (if E_q is 0 or missing, use factor_q = 1).
+          - Base_q = L_q.
+      • Forecast the next `horizon` quarters after C. For each future period p with quarter number q,
+        output V_p = Base_q * factor_q.
+    Returns a Timestamp-indexed Series (quarter ends), or `(series, debug)` if `return_debug=True`.
+    """
+    if qseries.empty:
+        return pd.Series(dtype=float)
+
+    if not isinstance(qseries.index, pd.PeriodIndex) or qseries.index.freqstr[0] != 'Q':
+        raise ValueError("colby_forecast_from_quarters expects a quarterly PeriodIndex series.")
+
+    latest_period = qseries.index.max()
+    cutoff = latest_period - 1
+    if cutoff not in qseries.index:
+        cutoff = latest_period
+
+    per_quarter_earliest = {}
+    per_quarter_latest = {}
+
+    for q in (1, 2, 3, 4):
+        candidates = [p for p in qseries.index if p.quarter == q]
+        candidates.sort()
+        per_quarter_earliest[q] = candidates[0] if candidates else None
+
+    for q in (1, 2, 3, 4):
+        same_year = pd.Period(year=cutoff.year, quarter=q, freq='Q')
+        if same_year in qseries.index and same_year <= cutoff:
+            per_quarter_latest[q] = same_year
+        else:
+            cands = [p for p in qseries.index if p.quarter == q and p <= cutoff]
+            per_quarter_latest[q] = max(cands) if cands else None
+
+    base = {}
+    factor = {}
+    for q in (1, 2, 3, 4):
+        Lp = per_quarter_latest[q]
+        Ep = per_quarter_earliest[q]
+        L = float(qseries.get(Lp, np.nan)) if Lp is not None else np.nan
+        E = float(qseries.get(Ep, np.nan)) if Ep is not None else np.nan
+        base[q] = 0.0 if np.isnan(L) else L
+        if np.isnan(E) or E == 0.0:
+            factor[q] = 1.0
+        else:
+            year_diff = abs(Lp.year - Ep.year) if (Lp is not None and Ep is not None) else 1
+            year_diff = max(1, year_diff)
+            rate = (base[q] - E) / E
+            factor[q] = 1.0 + rate / year_diff
+
+    fut_periods = pd.period_range(start=cutoff + 1, periods=horizon, freq='Q')
+    fut_index = fut_periods.to_timestamp(how='end')
+
+    values = []
+    rows = []
+    for p in fut_periods:
+        q = p.quarter
+        val = base[q] * factor[q]
+        values.append(val)
+        rows.append({
+            "Future Period": p.to_timestamp(how='end'),
+            "Quarter": q,
+            "Base L_q": base[q],
+            "E_q": (float(qseries.get(per_quarter_earliest[q], np.nan))
+                     if per_quarter_earliest[q] is not None else np.nan),
+            "factor_q": factor[q],
+            "Value": val,
+        })
+
+    series_out = pd.Series(values, index=fut_index, name="Colby Forecast")
+
+    if not return_debug:
+        return series_out
+
+    perq_rows = []
+    for q in (1, 2, 3, 4):
+        Ep = per_quarter_earliest[q]
+        Lp = per_quarter_latest[q]
+        perq_rows.append({
+            "Quarter": q,
+            "Earliest Period": Ep.to_timestamp(how='end') if Ep is not None else pd.NaT,
+            "E_q": (float(qseries.get(Ep, np.nan)) if Ep is not None else np.nan),
+            "Latest<=Cutoff": Lp.to_timestamp(how='end') if Lp is not None else pd.NaT,
+            "L_q": (float(qseries.get(Lp, np.nan)) if Lp is not None else np.nan),
+            "factor_q": factor[q],
+        })
+
+    debug = {
+        "cutoff_period": cutoff,
+        "cutoff_quarter_end": cutoff.to_timestamp(how='end') if isinstance(cutoff, pd.Period) else pd.NaT,
+        "per_quarter_table": pd.DataFrame(perq_rows),
+        "future_table": pd.DataFrame(rows),
+        "notes": "factor_q = 1 + (L_q - E_q) / E_q; if E_q <= 0 or missing → factor_q = 1",
+    }
+    return series_out, debug
+
+# --------------------------- UI -------------------------------
+
+st.title("Forecast")
+st.caption("Single-method app with cascading Product Filters.")
+f = st.file_uploader("Upload CSV", type=["csv"])
+with st.sidebar:
+    st.header("1) Data")
+    
+    st.markdown("""
+    *Expected columns (flexible):* `Customer`, `Part Number`, `Qty Due`, `Extended Amount`, `Due Date`.
+    You can choose actual date/value columns below.
+    """)
+
+main = st.container()
+
+if f is None:
+    st.info("Upload a CSV to begin.")
+    st.stop()
+
+# Load
+try:
+    df = load_csv(f)
+except Exception as e:
+    st.error(f"Couldn't read that CSV: {e}")
+    st.stop()
+
+if df.empty:
+    st.warning("Your file seems empty.")
+    st.stop()
+
+# Column selectors
+with st.sidebar:
+    st.header("2) Columns")
+    preferred_date = "Due Date"
+    preferred_value = "Qty Due"
+    preferred_customer = "Customer"
+    preferred_part = "Part Number"
+
+    # Date column options
+    date_cols = [c for c in df.columns if df[c].dtype == "O" or np.issubdtype(df[c].dtype, np.datetime64)]
+    if not date_cols:
+        date_cols = list(df.columns)
+    date_default = date_cols.index(preferred_date) if preferred_date in date_cols else 0
+    date_col = st.selectbox("Date column", options=date_cols, index=date_default)
+
+    # Value column options (numeric)
+    num_cols = [c for c in df.columns if _is_numeric(df[c])]
+    if not num_cols:
+        st.error("No numeric columns detected. Please include at least one numeric field (e.g., Qty Due).")
+        st.stop()
+    value_default = num_cols.index(preferred_value) if preferred_value in num_cols else 0
+    value_col = st.selectbox("Value column", options=num_cols, index=value_default)
+
+# --------- Product Filters (operate strictly on Part Number) ----------
+with st.sidebar:
+    st.header("3) Product Filters")
+    selections = render_product_filters()
+    if "Part Number" not in df.columns:
+        st.caption("ℹ️ These filters require a **Part Number** column; skipping if unavailable.")
+
+# Apply pattern-based Product Filters first (if Part Number exists)
+df_pf = filter_by_partnumber_patterns(df, selections)
+
+# Optional category filters (user-chosen columns)
+with st.sidebar:
+    st.header("4) Attribute Filters")
+    cust_col = st.selectbox("Customer column (optional)", ["(none)"] + df.columns.tolist(),
+                            index=(df.columns.tolist().index(preferred_customer) + 1
+                                   if preferred_customer in df.columns else 0))
+    part_col = st.selectbox("Part column (optional)", ["(none)"] + df.columns.tolist(),
+                            index=(df.columns.tolist().index(preferred_part) + 1
+                                   if preferred_part in df.columns else 0))
+
+# Parse dates safely
+try:
+    df_pf[date_col] = pd.to_datetime(df_pf[date_col], errors="coerce")
+except Exception:
+    pass
+
+# Build working frame with chosen columns
+keep_cols = [date_col, value_col]
+if cust_col != "(none)":
+    keep_cols.append(cust_col)
+if part_col != "(none)":
+    keep_cols.append(part_col)
+
+work = df_pf[keep_cols].copy()
+work = work.dropna(subset=[date_col, value_col])
+
+if work.empty:
+    st.error("No usable rows after parsing dates/values.")
+    st.stop()
+
+# User-facing attribute filters
+with st.sidebar:
+    if cust_col != "(none)":
+        customers = sorted(work[cust_col].dropna().unique().tolist())
+        sel_customers = st.multiselect("Customers", customers)
+        if sel_customers:
+            work = work[work[cust_col].isin(sel_customers)]
+    if part_col != "(none)":
+        parts = sorted(work[part_col].dropna().unique().tolist())
+        sel_parts = st.multiselect("Parts", parts)
+        if sel_parts:
+            work = work[work[part_col].isin(sel_parts)]
+
+# Date range filter (after parsing)
+min_d, max_d = work[date_col].min(), work[date_col].max()
+with st.sidebar:
+    st.header("5) Date Range")
+    if pd.isna(min_d) or pd.isna(max_d):
+        st.warning("Could not infer date range; using all rows.")
+        d_start, d_end = None, None
+    else:
+        d_start, d_end = st.slider(
+            "Limit data used",
+            min_value=min_d.to_pydatetime(),
+            max_value=max_d.to_pydatetime(),
+            value=(min_d.to_pydatetime(), max_d.to_pydatetime()),
+            format="YYYY-MM-DD",
+        )
+
+if d_start and d_end:
+    work = work[(work[date_col] >= d_start) & (work[date_col] <= d_end)]
+
+if work.empty:
+    st.warning("No rows remain after filtering.")
+    st.stop()
+
+# Frequency & horizon (Colby uses quarters)
+with st.sidebar:
+    st.header("6) Forecast Settings")
+    st.markdown("This method operates on **quarters** regardless of the raw data frequency.")
+    horizon = st.number_input("Forecast horizon (quarters)", min_value=1, max_value=12, value=4, step=1)
+    with st.expander("Parameters (placeholders)"):
+        p1 = st.text_input("param_1", value="")
+        p2 = st.text_input("param_2", value="")
+
+# ----------------- Build quarterly time series (sum) -----------------
+
+work = work.sort_values(date_col)
+qseries = (
+    work.set_index(date_col)[value_col]
+    .resample('Q')
+    .sum()
+    .asfreq('Q')
+    .fillna(0.0)
+)
+
+# History for plotting
+qseries_plot = qseries.copy()
+if isinstance(qseries_plot.index, pd.PeriodIndex):
+    qseries_plot.index = qseries_plot.index.to_timestamp(how='end')
+# (Usually qseries has DatetimeIndex already at quarter ends.)
+pqseries = qseries.copy()
+pqseries.index = pqseries.index.to_period('Q')
+
+# ------------------------- Forecast ----------------------------
+
+with st.container():
+    st.success("Colby Method is active and uses quarterly sums as defined.")
+
+result = colby_forecast_from_quarters(pqseries, horizon=int(horizon), return_debug=True)
+if isinstance(result, tuple):
+    forecast, debug = result
+else:
+    forecast, debug = result, None
+
+# ---------------------- Math / Steps ---------------------------
+
+with st.expander("Show math / steps"):
+    st.markdown(
+        r"""
+        **Colby per-quarter math**  
+        For each quarter *q*:
+        \(\text{factor}_q = 1 + \frac{L_q - E_q}{E_q}\) 
+        (if \(E_q\) is 0 or missing → factor\(_q\)=1)  
+        Future quarters after cutoff use \(V = L_q \times \text{factor}_q\).
+        """
+    )
+    if 'debug' in locals() and debug is not None:
+        st.write("**Cutoff quarter (last usable):**", debug["cutoff_quarter_end"])
+        st.markdown("**Per-quarter summary (earliest vs latest ≤ cutoff):**")
+        st.dataframe(debug["per_quarter_table"], use_container_width=True)
+        st.markdown("**Future quarters — step-by-step values:**")
+        st.dataframe(debug["future_table"], use_container_width=True)
+    else:
+        st.info("Debug info unavailable. (Run with return_debug=True.)")
+
+# -------------------------- Plot -------------------------------
+
+fig = go.Figure()
+fig.add_trace(
+    go.Scatter(x=qseries.index, y=qseries.values, mode="lines+markers", name="Quarterly History")
+)
+if not forecast.empty:
+    fig.add_trace(
+        go.Scatter(x=forecast.index, y=forecast.values, mode="lines+markers", name="Sales Forecast")
+    )
+fig.update_layout(title="Sales History + Forecast", height=480, margin=dict(l=10, r=10, t=40, b=10))
+st.plotly_chart(fig, use_container_width=True)
+
+# ------------------------ Forecast table -----------------------
+
+if not forecast.empty:
+    st.subheader("Forecast table")
+    out = (
+        forecast.rename("forecast")
+        .to_frame()
+        .reset_index()
+        .rename(columns={"index": "Quarter End"})
+    )
+    st.dataframe(out, use_container_width=True)
+else:
+    st.info("No forecast produced (need at least some quarterly history; if earliest same-quarter is zero or missing, forecast equals last usable quarter).")
+
+# -------------------- Quick summary counters -------------------
+
+with st.expander("Data summary after filters"):
+    st.write(f"**Rows in file:** {len(df):,}")
+    st.write(f"**Rows after Product Filters:** {len(df_pf):,}")
+    if "Part Number" in df.columns:
+        st.write(f"**Unique Part Numbers after Product Filters:** {df_pf['Part Number'].nunique():,}")

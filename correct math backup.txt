@@ -1,0 +1,385 @@
+# app.py — Colby-only Forecast App (scaffold)
+# -------------------------------------------------------------
+# You said: start fresh, only do the Colby method, keep filters.
+# You'll define the Colby method after. This file gives you a
+# clean Streamlit skeleton with:
+#  - CSV upload
+#  - Column selectors (date/value)
+#  - Filters (Customer, Part Number, date range)
+#  - Resampling frequency
+#  - Forecast horizon input
+#  - A placeholder Colby function you can replace later
+#  - Interactive chart + forecast table
+#
+# How to run:
+#   1) pip install streamlit pandas numpy plotly
+#   2) streamlit run app.py
+# -------------------------------------------------------------
+
+from __future__ import annotations
+import io
+from typing import Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+
+st.set_page_config(page_title="Forecast → Colby", layout="wide")
+
+# -------------------------- Utilities --------------------------
+
+def _is_numeric(s: pd.Series) -> bool:
+    return pd.api.types.is_numeric_dtype(s)
+
+@st.cache_data(show_spinner=False)
+def load_csv(file) -> pd.DataFrame:
+    df = pd.read_csv(file)
+    return df
+
+# --------------------- Colby (placeholder) ---------------------
+
+# --------------------- Colby (implementation) ---------------------
+
+def colby_forecast_from_quarters(qseries: pd.Series, horizon: int = 4, return_debug: bool = False):
+    """
+    Colby method — per-quarter growth:
+      • Work on quarterly totals.
+      • Exclude the quarter containing the latest date; call the cutoff quarter C = latest - 1 quarter.
+      • For each quarter number q ∈ {1,2,3,4}:
+          - L_q = value from the most recent year ≤ C that has quarter q (prefer the year of C if available).
+          - E_q = value from the earliest available year that has quarter q.
+          - factor_q = 1 + (L_q - E_q) / E_q  (if E_q is 0 or missing, use factor_q = 1).
+          - Base_q = L_q.
+      • Forecast the next `horizon` quarters after C. For each future period p with quarter number q,
+        output V_p = Base_q * factor_q.
+    Returns a Timestamp-indexed Series (quarter ends), or `(series, debug)` if `return_debug=True`.
+    """
+    if qseries.empty:
+        return pd.Series(dtype=float)
+
+    if not isinstance(qseries.index, pd.PeriodIndex) or qseries.index.freqstr[0] != 'Q':
+        raise ValueError("colby_forecast_from_quarters expects a quarterly PeriodIndex series.")
+
+    # Cutoff: last usable quarter is one quarter before latest
+    latest_period = qseries.index.max()
+    cutoff = latest_period - 1
+    if cutoff not in qseries.index:
+        cutoff = latest_period
+
+    # Build maps for earliest and latest (<=cutoff) values per quarter number
+    per_quarter_earliest = {}
+    per_quarter_latest = {}
+
+    # Earliest by quarter
+    for q in (1, 2, 3, 4):
+        candidates = [p for p in qseries.index if p.quarter == q]
+        candidates.sort()
+        per_quarter_earliest[q] = candidates[0] if candidates else None
+
+    # Latest (<= cutoff) by quarter — prefer year of cutoff if present
+    for q in (1, 2, 3, 4):
+        # Prefer the same year as cutoff first
+        same_year = pd.Period(year=cutoff.year, quarter=q, freq='Q')
+        if same_year in qseries.index and same_year <= cutoff:
+            per_quarter_latest[q] = same_year
+        else:
+            cands = [p for p in qseries.index if p.quarter == q and p <= cutoff]
+            per_quarter_latest[q] = max(cands) if cands else None
+
+    # Compute per-quarter bases and factors
+    base = {}
+    factor = {}
+    for q in (1, 2, 3, 4):
+        Lp = per_quarter_latest[q]
+        Ep = per_quarter_earliest[q]
+        L = float(qseries.get(Lp, np.nan)) if Lp is not None else np.nan
+        E = float(qseries.get(Ep, np.nan)) if Ep is not None else np.nan
+        base[q] = 0.0 if np.isnan(L) else L
+        if np.isnan(E) or E == 0.0:
+            factor[q] = 1.0
+        else:
+            # Compute how many years between earliest and latest same-quarter observations
+            if Lp is not None and Ep is not None:
+                year_diff = abs(Lp.year - Ep.year)
+            else:
+                year_diff = 1
+            if year_diff < 1:
+                year_diff = 1
+            rate = (base[q] - E) / E
+            factor[q] = 1.0 + rate / year_diff
+
+
+    # Create future index (next horizon quarters after cutoff)
+    fut_periods = pd.period_range(start=cutoff + 1, periods=horizon, freq='Q')
+    fut_index = fut_periods.to_timestamp(how='end')
+
+    # Map each future period to its per-quarter value
+    values = []
+    rows = []
+    for p in fut_periods:
+        q = p.quarter
+        val = base[q] * factor[q]
+        values.append(val)
+        rows.append({
+            "Future Period": p.to_timestamp(how='end'),
+            "Quarter": q,
+            "Base L_q": base[q],
+            "E_q": (float(qseries.get(per_quarter_earliest[q], np.nan))
+                     if per_quarter_earliest[q] is not None else np.nan),
+            "factor_q": factor[q],
+            "Value": val,
+        })
+
+    series_out = pd.Series(values, index=fut_index, name="Colby Forecast")
+
+    if not return_debug:
+        return series_out
+
+    # Build per-quarter summary table
+    perq_rows = []
+    for q in (1, 2, 3, 4):
+        Ep = per_quarter_earliest[q]
+        Lp = per_quarter_latest[q]
+        perq_rows.append({
+            "Quarter": q,
+            "Earliest Period": Ep.to_timestamp(how='end') if Ep is not None else pd.NaT,
+            "E_q": (float(qseries.get(Ep, np.nan)) if Ep is not None else np.nan),
+            "Latest<=Cutoff": Lp.to_timestamp(how='end') if Lp is not None else pd.NaT,
+            "L_q": (float(qseries.get(Lp, np.nan)) if Lp is not None else np.nan),
+            "factor_q": factor[q],
+        })
+
+    debug = {
+        "cutoff_period": cutoff,
+        "cutoff_quarter_end": cutoff.to_timestamp(how='end') if isinstance(cutoff, pd.Period) else pd.NaT,
+        "per_quarter_table": pd.DataFrame(perq_rows),
+        "future_table": pd.DataFrame(rows),
+        "notes": "factor_q = 1 + (L_q - E_q) / E_q; if E_q <= 0 or missing → factor_q = 1",
+    }
+
+    return series_out, debug
+
+# --------------------------- UI -------------------------------
+
+st.title("Colby Forecast")
+st.caption("Fresh scaffold: single-method app with filters. Swap in your Colby definition when ready.")
+
+with st.sidebar:
+    st.header("1) Data")
+    f = st.file_uploader("Upload CSV", type=["csv"])  
+    st.markdown("""
+    *Expected columns (flexible):* `Customer`, `Part Number`, `Qty Due`, `Extended Amount`, `Due Date`.
+    You can choose actual date/value columns below.
+    """)
+
+main = st.container()
+
+if f is None:
+    st.info("Upload a CSV to begin.")
+    st.stop()
+
+# Load
+try:
+    df = load_csv(f)
+except Exception as e:
+    st.error(f"Couldn't read that CSV: {e}")
+    st.stop()
+
+if df.empty:
+    st.warning("Your file seems empty.")
+    st.stop()
+
+# Column selectors
+with st.sidebar:
+    st.header("2) Columns")
+    # Preferred defaults based on your schema
+    preferred_date = "Due Date"
+    preferred_value = "Qty Due"
+    preferred_customer = "Customer"
+    preferred_part = "Part Number"
+
+    # Date column options
+    date_cols = [c for c in df.columns if df[c].dtype == "O" or np.issubdtype(df[c].dtype, np.datetime64)]
+    if not date_cols:
+        date_cols = list(df.columns)
+    date_default = date_cols.index(preferred_date) if preferred_date in date_cols else 0
+    date_col = st.selectbox("Date column", options=date_cols, index=date_default)
+
+    # Value column options (numeric)
+    num_cols = [c for c in df.columns if _is_numeric(df[c])]
+    if not num_cols:
+        st.error("No numeric columns detected. Please include at least one numeric field (e.g., Qty Due).")
+        st.stop()
+    value_default = num_cols.index(preferred_value) if preferred_value in num_cols else 0
+    value_col = st.selectbox("Value column", options=num_cols, index=value_default)
+
+    # Optional category filters
+    st.header("3) Filters")
+    all_cols = df.columns.tolist()
+    cust_options = ["(none)"] + all_cols
+    part_options = ["(none)"] + all_cols
+    cust_default = cust_options.index(preferred_customer) if preferred_customer in all_cols else 0
+    part_default = part_options.index(preferred_part) if preferred_part in all_cols else 0
+    cust_col = st.selectbox("Customer column (optional)", cust_options, index=cust_default)
+    part_col = st.selectbox("Part column (optional)", part_options, index=part_default)
+
+    # Frequency & horizon
+    st.header("3) Filters")
+    cust_col_candidates = [c for c in df.columns if c.lower() in {"customer", "customer name", "account"}]
+    part_col_candidates = [c for c in df.columns if c.lower() in {"part number", "part", "sku", "item"}]
+
+    cust_col = st.selectbox("Customer column (optional)", ["(none)"] + df.columns.tolist(), index=0)
+    part_col = st.selectbox("Part column (optional)", ["(none)"] + df.columns.tolist(), index=0)
+
+    # Frequency & horizon
+    st.header("4) Forecast settings")
+    st.markdown("This method operates on **quarters** regardless of the raw data frequency.")
+    horizon = st.number_input("Forecast horizon (quarters)", min_value=1, max_value=12, value=4, step=1)
+
+    with st.expander("Colby parameters (you'll define)"):
+        st.markdown("Add any knobs your method needs here. For now, these are placeholders.")
+        p1 = st.text_input("param_1", value="")
+        p2 = st.text_input("param_2", value="")
+
+# --------------------- Preprocess & Filter ---------------------
+
+# Parse dates safely
+try:
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+except Exception:
+    pass
+
+# Drop rows without date or value
+work = df[[date_col, value_col] + ([cust_col] if cust_col != "(none)" else []) + ([part_col] if part_col != "(none)" else [])].copy()
+work = work.dropna(subset=[date_col, value_col])
+
+if work.empty:
+    st.error("No usable rows after parsing dates/values.")
+    st.stop()
+
+# User-facing filters for customer & part
+with st.sidebar:
+    if cust_col != "(none)":
+        customers = sorted(work[cust_col].dropna().unique().tolist())
+        sel_customers = st.multiselect("Customers", customers)
+        if sel_customers:
+            work = work[work[cust_col].isin(sel_customers)]
+    if part_col != "(none)":
+        parts = sorted(work[part_col].dropna().unique().tolist())
+        sel_parts = st.multiselect("Parts", parts)
+        if sel_parts:
+            work = work[work[part_col].isin(sel_parts)]
+
+# Date range filter (after parsing)
+min_d, max_d = work[date_col].min(), work[date_col].max()
+with st.sidebar:
+    st.header("5) Date range")
+    if pd.isna(min_d) or pd.isna(max_d):
+        st.warning("Could not infer date range; using all rows.")
+        d_start, d_end = None, None
+    else:
+        d_start, d_end = st.slider(
+            "Limit data used",
+            min_value=min_d.to_pydatetime(),
+            max_value=max_d.to_pydatetime(),
+            value=(min_d.to_pydatetime(), max_d.to_pydatetime()),
+            format="YYYY-MM-DD",
+        )
+
+if d_start and d_end:
+    work = work[(work[date_col] >= d_start) & (work[date_col] <= d_end)]
+
+if work.empty:
+    st.warning("No rows remain after filtering.")
+    st.stop()
+
+# Build quarterly time series (sum)
+work = work.sort_values(date_col)
+qseries = (
+    work.set_index(date_col)[value_col]
+    .resample('Q')
+    .sum()
+    .asfreq('Q')
+    .fillna(0.0)
+)
+
+# History for plotting
+qseries_plot = qseries.copy()
+# Convert to Timestamp only if we have a PeriodIndex
+if isinstance(qseries_plot.index, pd.PeriodIndex):
+    qseries_plot.index = qseries_plot.index.to_timestamp(how='end')
+
+# Convert to PeriodIndex('Q') for method input
+pqseries = qseries.copy()
+pqseries.index = pqseries.index.to_period('Q')
+
+# ------------------------- Forecast ----------------------------
+
+with st.container():
+    st.success("Colby method is active and uses quarterly sums as defined.")
+
+result = colby_forecast_from_quarters(pqseries, horizon=int(horizon), return_debug=True)
+if isinstance(result, tuple):
+    forecast, debug = result
+else:
+    forecast, debug = result, None
+
+
+
+# ---------------------- Math / Steps ---------------------------
+with st.expander("Show math / steps"):
+    st.markdown(
+        r"""
+        **Colby per-quarter math**  
+        For each quarter *q*:
+        \(\text{factor}_q = 1 + \frac{L_q - E_q}{E_q}\) 
+        (if \(E_q\) is 0 or missing → factor\(_q\)=1)  
+        Future quarters after cutoff use \(V = L_q \times \text{factor}_q\).
+        """
+    )
+    if 'debug' in locals() and debug is not None:
+        st.write("**Cutoff quarter (last usable):**", debug["cutoff_quarter_end"])
+        st.markdown("**Per-quarter summary (earliest vs latest ≤ cutoff):**")
+        st.dataframe(debug["per_quarter_table"], use_container_width=True)
+        st.markdown("**Future quarters — step-by-step values:**")
+        st.dataframe(debug["future_table"], use_container_width=True)
+    else:
+        st.info("Debug info unavailable. (Run with return_debug=True.)")
+
+
+# -------------------------- Plot -------------------------------
+
+fig = go.Figure()
+fig.add_trace(
+    go.Scatter(x=qseries_plot.index, y=qseries_plot.values, mode="lines+markers", name="Quarterly History")
+)
+if not forecast.empty:
+    st.subheader("Forecast table")
+    out = (
+        forecast.rename("forecast")
+        .to_frame()
+        .reset_index()
+        .rename(columns={"index": "Quarter End"})
+    )
+    st.dataframe(out, use_container_width=True)
+else:
+    st.info("No forecast produced (need at least some quarterly history; if earliest same-quarter is zero or missing, forecast equals last usable quarter).")
+
+# ----------------------- Footer helper -------------------------
+
+with st.expander("Developer notes"):
+    st.markdown(
+        """
+        **Where to implement Colby:**
+        - Edit the `colby_forecast()` function near the top of this file.
+        - Input: a regular, summed `pd.Series` at your chosen frequency (DatetimeIndex converted to PeriodIndex beforehand).
+        - Output: a `pd.Series` indexed by *future* Timestamps (not Periods), length = `horizon`.
+
+        **Common options you might add:**
+        - Backtest split and error metrics (MAE/MAPE/RMSE)
+        - Season length / parameters specific to your method
+        - Option to aggregate by both Customer & Part (facet charts)
+        - Export to CSV
+        """
+    )
